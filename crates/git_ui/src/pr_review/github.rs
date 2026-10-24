@@ -7,9 +7,36 @@ use serde::Deserialize;
 
 use super::GhUser;
 
-const LIST_FIELDS: &str =
-    "number,title,author,isDraft,headRefName,statusCheckRollup,reviewDecision";
-const LIST_LIMIT: &str = "50";
+/// How many pull requests a section fetches at a time.
+pub(crate) const PAGE_SIZE: usize = 5;
+
+const LIST_QUERY: &str = "query($searchQuery: String!, $first: Int!, $after: String) {
+  search(query: $searchQuery, type: ISSUE, first: $first, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        number title isDraft headRefName reviewDecision
+        author { login }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                contexts(first: 100) {
+                  nodes {
+                    __typename
+                    ... on CheckRun { status conclusion }
+                    ... on StatusContext { state }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}";
 
 const FILES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -41,7 +68,9 @@ async fn gh(dir: &Path, args: &[&str]) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("{}", stderr.trim());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
 }
 
 /// A group of pull requests in the panel.
@@ -67,11 +96,15 @@ impl Section {
         }
     }
 
-    fn filter_args(self) -> &'static [&'static str] {
+    fn search_query(self) -> &'static str {
         match self {
-            Section::WaitingForMyReview => &["--search", "review-requested:@me"],
-            Section::CreatedByMe => &["--author", "@me"],
-            Section::AllOpen => &[],
+            Section::WaitingForMyReview => {
+                "repo:{owner}/{repo} is:pr is:open sort:created-desc review-requested:@me"
+            }
+            Section::CreatedByMe => {
+                "repo:{owner}/{repo} is:pr is:open sort:created-desc author:@me"
+            }
+            Section::AllOpen => "repo:{owner}/{repo} is:pr is:open sort:created-desc",
         }
     }
 }
@@ -85,20 +118,6 @@ pub(crate) enum CheckStatus {
     None,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ListedPullRequest {
-    number: u32,
-    title: String,
-    author: GhUser,
-    is_draft: bool,
-    head_ref_name: String,
-    #[serde(default)]
-    status_check_rollup: Vec<serde_json::Value>,
-    #[serde(default)]
-    review_decision: Option<String>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PullRequestSummary {
     pub number: u32,
@@ -110,30 +129,143 @@ pub(crate) struct PullRequestSummary {
     pub review_decision: Option<String>,
 }
 
-pub(crate) async fn list_section(repo: &Path, section: Section) -> Result<Vec<PullRequestSummary>> {
-    let mut args = vec!["pr", "list", "--limit", LIST_LIMIT, "--json", LIST_FIELDS];
-    args.extend_from_slice(section.filter_args());
-    let output = gh(repo, &args).await?;
-    parse_pull_request_list(&output)
+/// One page of a section's pull requests, newest first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PullRequestPage {
+    pub pull_requests: Vec<PullRequestSummary>,
+    /// How many pull requests match the section, across all pages.
+    pub total_count: usize,
+    /// Pass to `list_section` to fetch the next page; `None` on the last page.
+    pub next_cursor: Option<String>,
 }
 
-fn parse_pull_request_list(output: &str) -> Result<Vec<PullRequestSummary>> {
-    let listed: Vec<ListedPullRequest> =
+pub(crate) async fn list_section(
+    repo: &Path,
+    section: Section,
+    after: Option<&str>,
+) -> Result<PullRequestPage> {
+    let search_query = format!("searchQuery={}", section.search_query());
+    let first = format!("first={PAGE_SIZE}");
+    let query = format!("query={LIST_QUERY}");
+    let mut args: Vec<&str> = vec![
+        "api",
+        "graphql",
+        "-F",
+        &search_query,
+        "-F",
+        &first,
+        "-f",
+        &query,
+    ];
+    let after = after.map(|cursor| format!("after={cursor}"));
+    if let Some(after) = &after {
+        args.extend(["-f", after.as_str()]);
+    }
+    let output = gh(repo, &args).await?;
+    parse_pull_request_page(&output)
+}
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    data: SearchData,
+}
+
+#[derive(Deserialize)]
+struct SearchData {
+    search: SearchConnection,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchConnection {
+    issue_count: usize,
+    page_info: PageInfo,
+    nodes: Vec<Option<SearchPullRequest>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchPullRequest {
+    number: u32,
+    title: String,
+    /// `None` when the author's account was deleted.
+    author: Option<GhUser>,
+    is_draft: bool,
+    head_ref_name: String,
+    review_decision: Option<String>,
+    commits: Nodes<CommitNode>,
+}
+
+#[derive(Deserialize)]
+struct Nodes<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitNode {
+    commit: Commit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Commit {
+    status_check_rollup: Option<StatusCheckRollup>,
+}
+
+#[derive(Deserialize)]
+struct StatusCheckRollup {
+    contexts: Nodes<serde_json::Value>,
+}
+
+fn parse_pull_request_page(output: &str) -> Result<PullRequestPage> {
+    let response: SearchResponse =
         serde_json::from_str(output).context("reading the pull request list")?;
-    Ok(listed
+    let search = response.data.search;
+    let pull_requests = search
+        .nodes
         .into_iter()
-        .map(|pull_request| PullRequestSummary {
-            checks: check_status(&pull_request.status_check_rollup),
-            number: pull_request.number,
-            title: pull_request.title,
-            author: pull_request.author.login,
-            is_draft: pull_request.is_draft,
-            head_ref_name: pull_request.head_ref_name,
-            review_decision: pull_request
-                .review_decision
-                .filter(|decision| !decision.is_empty()),
+        .flatten()
+        .map(|pull_request| {
+            let checks = pull_request
+                .commits
+                .nodes
+                .into_iter()
+                .next()
+                .and_then(|node| node.commit.status_check_rollup)
+                .map_or(CheckStatus::None, |rollup| {
+                    check_status(&rollup.contexts.nodes)
+                });
+            PullRequestSummary {
+                checks,
+                number: pull_request.number,
+                title: pull_request.title,
+                author: pull_request
+                    .author
+                    .map_or_else(|| "ghost".to_string(), |author| author.login),
+                is_draft: pull_request.is_draft,
+                head_ref_name: pull_request.head_ref_name,
+                review_decision: pull_request
+                    .review_decision
+                    .filter(|decision| !decision.is_empty()),
+            }
         })
-        .collect())
+        .collect();
+    Ok(PullRequestPage {
+        pull_requests,
+        total_count: search.issue_count,
+        next_cursor: search
+            .page_info
+            .end_cursor
+            .filter(|_| search.page_info.has_next_page),
+    })
 }
 
 /// Folds GitHub's check runs and commit statuses into one state: any failure
@@ -358,28 +490,59 @@ mod tests {
             CheckStatus::Failure
         );
         assert_eq!(
-            check_status(&parse(r#"[{"__typename":"StatusContext","state":"ERROR"}]"#)),
+            check_status(&parse(
+                r#"[{"__typename":"StatusContext","state":"ERROR"}]"#
+            )),
             CheckStatus::Failure
         );
     }
 
     #[test]
-    fn test_parse_pull_request_list() {
-        let output = r#"[{"author":{"login":"ada"},"headRefName":"feat/x","isDraft":true,
-            "number":66,"reviewDecision":"","statusCheckRollup":[],"title":"Add x"}]"#;
-        let list = parse_pull_request_list(output).expect("parses");
+    fn test_parse_pull_request_page() {
+        let output = r#"{"data":{"search":{"issueCount":7,
+            "pageInfo":{"hasNextPage":true,"endCursor":"Y3Vyc29yOjU="},
+            "nodes":[
+                {"number":66,"title":"Add x","isDraft":true,"headRefName":"feat/x",
+                 "reviewDecision":null,"author":{"login":"ada"},
+                 "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}},
+                {"number":65,"title":"Fix y","isDraft":false,"headRefName":"fix/y",
+                 "reviewDecision":"APPROVED","author":null,
+                 "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[
+                     {"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}
+                 ]}}}}]}}
+            ]}}}"#;
+        let page = parse_pull_request_page(output).expect("parses");
+        assert_eq!(page.total_count, 7);
+        assert_eq!(page.next_cursor.as_deref(), Some("Y3Vyc29yOjU="));
         assert_eq!(
-            list,
-            vec![PullRequestSummary {
-                number: 66,
-                title: "Add x".into(),
-                author: "ada".into(),
-                is_draft: true,
-                head_ref_name: "feat/x".into(),
-                checks: CheckStatus::None,
-                review_decision: None,
-            }]
+            page.pull_requests,
+            vec![
+                PullRequestSummary {
+                    number: 66,
+                    title: "Add x".into(),
+                    author: "ada".into(),
+                    is_draft: true,
+                    head_ref_name: "feat/x".into(),
+                    checks: CheckStatus::None,
+                    review_decision: None,
+                },
+                PullRequestSummary {
+                    number: 65,
+                    title: "Fix y".into(),
+                    author: "ghost".into(),
+                    is_draft: false,
+                    head_ref_name: "fix/y".into(),
+                    checks: CheckStatus::Failure,
+                    review_decision: Some("APPROVED".into()),
+                },
+            ]
         );
+
+        let last_page = r#"{"data":{"search":{"issueCount":0,
+            "pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}"#;
+        let page = parse_pull_request_page(last_page).expect("parses");
+        assert!(page.pull_requests.is_empty());
+        assert_eq!(page.next_cursor, None);
     }
 
     #[test]
