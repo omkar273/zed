@@ -589,13 +589,6 @@ pub fn register(workspace: &mut Workspace) {
             });
         }
     });
-    workspace.register_action(|workspace, _: &ToggleCommitEditor, window, cx| {
-        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
-            panel.update(cx, |panel, cx| {
-                panel.toggle_commit_editor(&Default::default(), window, cx)
-            });
-        }
-    });
     workspace.register_action(|workspace, _: &git::Init, window, cx| {
         if let Some(panel) = workspace.panel::<GitPanel>(cx) {
             panel.update(cx, |panel, cx| panel.git_init(window, cx));
@@ -7206,7 +7199,6 @@ impl GitPanel {
                 }))
         });
 
-        let collapsed = self.commit_editor_collapsed;
         let editor_focused = self
             .commit_editor
             .focus_handle(cx)
@@ -7226,50 +7218,48 @@ impl GitPanel {
             .when(!self.commit_editor_expanded, |this| {
                 this.flex_none().border_b_1().border_color(colors.border)
             })
-            .when(!collapsed, |this| {
-                this.child(
-                    panel_editor_container(window, cx)
-                        .id("commit-editor-container")
-                        .w_full()
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(message_border_color)
-                        .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            window.focus(&this.commit_editor.focus_handle(cx), cx);
-                        }))
-                        .child(
-                            h_flex()
-                                .size_full()
-                                .items_start()
-                                .child(
-                                    div()
-                                        .py_1()
-                                        .pl_2()
-                                        .h_full()
-                                        .flex_grow_1()
-                                        .cursor_text()
-                                        .on_action(|&zed_actions::editor::MoveUp, _, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .on_action(|&zed_actions::editor::MoveDown, _, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .child(EditorElement::new(
-                                            &self.commit_editor,
-                                            panel_editor_style,
-                                        )),
-                                )
-                                .child(
-                                    h_flex()
-                                        .flex_none()
-                                        .pt_0p5()
-                                        .children(self.render_generate_commit_message_button(cx))
-                                        .child(editor_buttons),
-                                ),
-                        ),
-                )
-            })
+            .child(
+                panel_editor_container(window, cx)
+                    .id("commit-editor-container")
+                    .w_full()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(message_border_color)
+                    .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.commit_editor.focus_handle(cx), cx);
+                    }))
+                    .child(
+                        h_flex()
+                            .size_full()
+                            .items_start()
+                            .child(
+                                div()
+                                    .py_1()
+                                    .pl_2()
+                                    .h_full()
+                                    .flex_grow_1()
+                                    .cursor_text()
+                                    .on_action(|&zed_actions::editor::MoveUp, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_action(|&zed_actions::editor::MoveDown, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .child(EditorElement::new(
+                                        &self.commit_editor,
+                                        panel_editor_style,
+                                    )),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .pt_0p5()
+                                    .children(self.render_generate_commit_message_button(cx))
+                                    .child(editor_buttons),
+                            ),
+                    ),
+            )
             .when(title_exceeds_limit, |this| {
                 this.child(
                     h_flex()
@@ -9736,7 +9726,6 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::focus_changes_list))
             .on_action(cx.listener(Self::focus_editor))
             .on_action(cx.listener(Self::expand_commit_editor))
-            .on_action(cx.listener(Self::toggle_commit_editor))
             .when(has_write_access && has_co_authors, |git_panel| {
                 git_panel.on_action(cx.listener(Self::toggle_fill_co_authors))
             })
@@ -9842,7 +9831,6 @@ impl editor::Addon for GitPanelAddon {
 impl Panel for GitPanel {
     fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
         if self.active_tab == GitPanelTab::Changes
-            && !self.commit_editor_collapsed
             && (self.entries.is_empty() || self.commit_editor_expanded)
         {
             self.commit_editor.focus_handle(cx)
