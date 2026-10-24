@@ -69,25 +69,25 @@ jobs:
           tag="caygnus-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
         fi
         version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
-          target/aarch64-apple-darwin/release/dmg/Zed.app/Contents/Info.plist)
-        cp target/aarch64-apple-darwin/release/Zed-aarch64.dmg "Zed-${tag}-aarch64.dmg"
+          target/aarch64-apple-darwin/release/dmg/Caygnus.app/Contents/Info.plist)
+        cp target/aarch64-apple-darwin/release/Caygnus-aarch64.dmg "Caygnus-${tag}-aarch64.dmg"
         cat > release-notes.md <<EOF
-        Zed ${version} with the Caygnus changes, built from ${GITHUB_SHA::7}.
+        Caygnus ${version}, a fork of Zed, built from ${GITHUB_SHA::7}.
 
         **Apple Silicon Macs only** (M1 or later).
 
         ### Install
 
-        1. Open the DMG and drag **Zed** into Applications.
+        1. Open the DMG and drag **Caygnus** into Applications.
         2. The app isn't signed with an Apple Developer ID, so macOS blocks it the first time. Run this once in Terminal:
 
            \`\`\`
-           xattr -dr com.apple.quarantine /Applications/Zed.app
+           xattr -dr com.apple.quarantine /Applications/Caygnus.app
            \`\`\`
 
-        The app's bundle id is \`com.caygnus.zed\`, so it installs next to official Zed instead of replacing it. It doesn't update itself; download a newer release to update.
+        The app's bundle id is \`com.caygnus.Caygnus\`, so it installs next to official Zed instead of replacing it. It doesn't update itself; download a newer release to update.
         EOF
-        gh release create "$tag" "Zed-${tag}-aarch64.dmg" \
+        gh release create "$tag" "Caygnus-${tag}-aarch64.dmg" \
           --target "$GITHUB_SHA" \
-          --title "Zed (Caygnus) ${tag}" \
+          --title "Caygnus ${tag}" \
           --notes-file release-notes.md
