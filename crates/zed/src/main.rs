@@ -31,7 +31,8 @@ use futures::{FutureExt, StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
-    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
+    App, AppContext, Application, AsyncApp, Context, QuitMode, Task, TaskExt, UpdateGlobal as _,
+    Window, block_on,
 };
 use gpui_platform;
 
@@ -67,7 +68,7 @@ use theme_settings::load_user_theme;
 use util::{ResultExt, maybe};
 use uuid::Uuid;
 use workspace::{
-    AppState, MultiWorkspace, SerializedWorkspaceLocation, SessionWorkspace, Toast,
+    AppState, MultiWorkspace, SerializedWorkspaceLocation, SessionWorkspace, Toast, Workspace,
     WorkspaceSettings, WorkspaceStore,
     notifications::{NotificationId, NotifyResultExt},
     restore_multiworkspace,
@@ -1539,16 +1540,7 @@ pub(crate) async fn restore_or_create_workspace(
                     Default::default(),
                     app_state.clone(),
                     cx,
-                    |workspace, window, cx| {
-                        let restore_on_startup =
-                            WorkspaceSettings::get_global(cx).restore_on_startup;
-                        match restore_on_startup {
-                            workspace::RestoreOnStartupBehavior::Launchpad => {}
-                            _ => {
-                                Editor::new_file(workspace, &Default::default(), window, cx);
-                            }
-                        }
-                    },
+                    open_empty_tab_if_requested,
                 )
             })
             .await?;
@@ -1561,21 +1553,30 @@ pub(crate) async fn restore_or_create_workspace(
                 Default::default(),
                 app_state,
                 cx,
-                |workspace, window, cx| {
-                    let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
-                    match restore_on_startup {
-                        workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
-                        }
-                    }
-                },
+                open_empty_tab_if_requested,
             )
         })
         .await?;
     }
 
     Ok(())
+}
+
+/// Only `empty_tab` asks for an untitled buffer. When `last_session` or
+/// `last_workspace` find nothing to restore, the empty workspace shows the
+/// welcome page instead; an untitled buffer opened here would be serialized
+/// into the session and restored as a stray tab on every later launch.
+fn open_empty_tab_if_requested(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if matches!(
+        WorkspaceSettings::get_global(cx).restore_on_startup,
+        workspace::RestoreOnStartupBehavior::EmptyTab
+    ) {
+        Editor::new_file(workspace, &Default::default(), window, cx);
+    }
 }
 
 async fn restorable_workspaces(
