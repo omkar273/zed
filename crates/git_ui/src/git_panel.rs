@@ -91,7 +91,7 @@ use time::OffsetDateTime;
 use ui::{
     ButtonLike, Chip, ContextMenu, ContextMenuEntry, DocumentationSide, ElevationIndex,
     IndentGuideColors, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, SplitButton, Tab, TintColor, Tooltip, WithScrollbar, prelude::*,
+    Scrollbars, Tab, TintColor, Tooltip, WithScrollbar, prelude::*,
 };
 use util::paths::PathStyle;
 use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
@@ -1365,6 +1365,23 @@ impl From<&Arc<InitialGraphCommitData>> for CommitHistoryEntry {
 const DEFAULT_COMMIT_PLACEHOLDER: &str = "Message (⌘⏎ to commit)";
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_COMMIT_PLACEHOLDER: &str = "Message (Ctrl+Enter to commit)";
+const COMMIT_BUTTON_HEIGHT: f32 = 26.;
+
+/// The commit button is a solid accent color, like VS Code's primary button,
+/// rather than one of the theme's tinted button styles.
+fn commit_button_backgrounds(cx: &App) -> (gpui::Hsla, gpui::Hsla) {
+    let accent = cx.theme().colors().text_accent;
+    let saturation = accent.s.max(0.55);
+    (
+        gpui::hsla(accent.h, saturation, 0.47, 1.),
+        gpui::hsla(accent.h, saturation, 0.53, 1.),
+    )
+}
+
+fn commit_button_foreground() -> gpui::Hsla {
+    gpui::hsla(0., 0., 1., 1.)
+}
+
 const MIN_PANEL_EDITOR_LINES: usize = 3;
 const MAX_PANEL_EDITOR_LINES: usize = 10;
 
@@ -6756,11 +6773,24 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let menu_open = self.commit_menu_handle.is_deployed();
+        let chevron_icon = if menu_open {
+            IconName::ChevronUp
+        } else {
+            IconName::ChevronDown
+        };
 
         PopoverMenu::new(id.into())
             .trigger(
-                crate::render_split_button_chevron_trigger("commit-split-button-right", menu_open)
-                    .disabled(disabled),
+                ButtonLike::new_rounded_right("commit-split-button-right")
+                    .style(ButtonStyle::Transparent)
+                    .width(rems_from_px(24_f32))
+                    .height(px(COMMIT_BUTTON_HEIGHT).into())
+                    .disabled(disabled)
+                    .child(
+                        Icon::new(chevron_icon)
+                            .size(IconSize::Small)
+                            .color(Color::Custom(commit_button_foreground())),
+                    ),
             )
             .with_handle(self.commit_menu_handle.clone())
             .menu({
@@ -7135,9 +7165,6 @@ impl GitPanel {
         let panel_editor_style =
             git_commit_editor_style(settings.git_commit_buffer_font_size(cx), cx);
         let enable_coauthors = self.render_co_authors(cx);
-        let editor_is_long = self.commit_editor.update(cx, |editor, cx| {
-            editor.max_point(cx).row().0 >= MAX_PANEL_EDITOR_LINES as u32
-        });
 
         let max_title_length = GitPanelSettings::get_global(cx).commit_title_max_length;
         let title_exceeds_limit = if max_title_length > 0 {
@@ -7180,55 +7207,45 @@ impl GitPanel {
         });
 
         let collapsed = self.commit_editor_collapsed;
+        let editor_focused = self
+            .commit_editor
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        let colors = cx.theme().colors();
+        let message_border_color = if title_exceeds_limit {
+            cx.theme().status().warning_border
+        } else if editor_focused {
+            colors.border_focused
+        } else {
+            colors.border_variant
+        };
         let footer = v_flex()
+            .p_2()
+            .gap_1p5()
             .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
             .when(!self.commit_editor_expanded, |this| {
-                this.flex_none()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border)
+                this.flex_none().border_b_1().border_color(colors.border)
             })
-            .when(title_exceeds_limit, |this| {
+            .when(!collapsed, |this| {
                 this.child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .gap_1()
-                        .border_t_1()
-                        .border_color(cx.theme().status().warning_border)
-                        .bg(cx.theme().status().warning_background.opacity(0.5))
-                        .child(
-                            Icon::new(IconName::Warning)
-                                .size(IconSize::XSmall)
-                                .color(Color::Warning),
-                        )
-                        .child(
-                            Label::new(format!(
-                                "Commit message title exceeds {max_title_length}-character limit."
-                            ))
-                            .size(LabelSize::Small),
-                        ),
-                )
-            })
-            .child(
-                panel_editor_container(window, cx)
-                    .id("commit-editor-container")
-                    .w_full()
-                    .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
-                    .when(title_exceeds_limit, |this| {
-                        this.border_t_1()
-                            .border_color(cx.theme().status().warning_border)
-                    })
-                    .when(!collapsed, |this| {
-                        this.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    panel_editor_container(window, cx)
+                        .id("commit-editor-container")
+                        .w_full()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(message_border_color)
+                        .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             window.focus(&this.commit_editor.focus_handle(cx), cx);
                         }))
                         .child(
                             h_flex()
                                 .size_full()
+                                .items_start()
                                 .child(
                                     div()
-                                        .pt_2()
-                                        .px_2()
+                                        .py_1()
+                                        .pl_2()
                                         .h_full()
                                         .flex_grow_1()
                                         .cursor_text()
@@ -7243,34 +7260,41 @@ impl GitPanel {
                                             panel_editor_style,
                                         )),
                                 )
-                                .child(editor_buttons),
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .pt_0p5()
+                                        .children(self.render_generate_commit_message_button(cx))
+                                        .child(editor_buttons),
+                                ),
+                        ),
+                )
+            })
+            .when(title_exceeds_limit, |this| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::XSmall)
+                                .color(Color::Warning),
                         )
-                    })
-                    .child(
-                        h_flex()
-                            .id("commit-footer")
-                            .w_full()
-                            .p_1p5()
-                            .gap_1()
-                            .border_t_1()
-                            .when(editor_is_long, |el| {
-                                el.border_color(cx.theme().colors().border_variant)
-                            })
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .gap_0p5()
-                                    .children(self.render_generate_commit_message_button(cx)),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap_0p5()
-                                    .children(enable_coauthors)
-                                    .child(self.render_commit_button(cx)),
-                            ),
-                    ),
+                        .child(
+                            Label::new(format!(
+                                "Commit message title exceeds {max_title_length}-character limit."
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        ),
+                )
+            })
+            .child(
+                h_flex()
+                    .id("commit-footer")
+                    .w_full()
+                    .gap_1()
+                    .children(enable_coauthors)
+                    .child(self.render_commit_button(cx)),
             );
 
         Some(footer)
@@ -7279,6 +7303,12 @@ impl GitPanel {
     fn render_commit_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (can_commit, tooltip) = self.configure_commit_button(cx);
         let title = self.commit_button_title();
+        let label = if self.amend_pending { "Amend" } else { "Commit" };
+        let tooltip = match tooltip {
+            "Commit Tracked" => "Commit All Tracked Changes",
+            "Amend Tracked" => "Amend With All Tracked Changes",
+            tooltip => tooltip,
+        };
         let commit_tooltip_focus_handle = self.commit_editor.focus_handle(cx);
         let options = self.commit_options();
         let amend = options.amend;
@@ -7286,85 +7316,93 @@ impl GitPanel {
         let no_verify = options.no_verify;
 
         let commit_enabled = can_commit && !self.modal_open && self.pending_commit.is_none();
-        let label_color = if commit_enabled {
-            Color::Default
-        } else {
-            Color::Disabled
-        };
+        let (background, hover_background) = commit_button_backgrounds(cx);
+        let foreground = commit_button_foreground();
 
         h_flex()
             .id("commit-wrapper")
             .flex_1()
             .min_w_0()
+            .h(px(COMMIT_BUTTON_HEIGHT))
+            .rounded(px(4.))
+            .overflow_hidden()
+            .bg(background)
+            .when(!commit_enabled, |this| this.opacity(0.55))
             .on_hover(cx.listener(move |this, hovered, _, cx| {
                 this.show_placeholders =
                     *hovered && !this.has_staged_changes() && !this.has_unstaged_conflicts();
                 cx.notify()
             }))
             .child(
-                SplitButton::new(
-                    ButtonLike::new_rounded_left(format!("split-button-left-{}", title))
-                        .layer(ElevationIndex::ModalSurface)
-                        .size(ButtonSize::Compact)
-                        .full_width()
-                        .when(commit_enabled, |this| {
-                            this.style(ButtonStyle::Tinted(TintColor::Accent))
-                        })
-                        .disabled(!can_commit || self.modal_open)
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .gap_1()
-                                .justify_center()
-                                .child(
-                                    Icon::new(IconName::Check)
-                                        .size(IconSize::Small)
-                                        .color(label_color),
-                                )
-                                .child(Label::new(title).size(LabelSize::Small).color(label_color)),
-                        )
-                        .on_click({
-                            let git_panel = cx.weak_entity();
-                            move |_, window, cx| {
+                h_flex()
+                    .id(format!("commit-button-{title}"))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .gap_1()
+                    .justify_center()
+                    .when(commit_enabled, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(hover_background))
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 telemetry::event!("Git Committed", source = "Git Panel");
-                                git_panel
-                                    .update(cx, |git_panel, cx| {
-                                        let options = git_panel.commit_options();
-                                        git_panel.commit_changes(options, window, cx);
-                                    })
-                                    .ok();
+                                let options = this.commit_options();
+                                this.commit_changes(options, window, cx);
+                            }))
+                    })
+                    .child(
+                        Icon::new(IconName::Check)
+                            .size(IconSize::Small)
+                            .color(Color::Custom(foreground)),
+                    )
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::MEDIUM)
+                            .color(Color::Custom(foreground)),
+                    )
+                    .tooltip({
+                        let handle = commit_tooltip_focus_handle.clone();
+                        move |_window, cx| {
+                            if can_commit {
+                                Tooltip::with_meta_in(
+                                    tooltip,
+                                    Some(&git::Commit),
+                                    format!(
+                                        "git commit{}{}{}",
+                                        if amend { " --amend" } else { "" },
+                                        if signoff { " --signoff" } else { "" },
+                                        if no_verify { " --no-verify" } else { "" }
+                                    ),
+                                    &handle.clone(),
+                                    cx,
+                                )
+                            } else {
+                                Tooltip::simple(tooltip, cx)
                             }
-                        })
-                        .tooltip({
-                            let handle = commit_tooltip_focus_handle.clone();
-                            move |_window, cx| {
-                                if can_commit {
-                                    Tooltip::with_meta_in(
-                                        tooltip,
-                                        Some(&git::Commit),
-                                        format!(
-                                            "git commit{}{}{}",
-                                            if amend { " --amend" } else { "" },
-                                            if signoff { " --signoff" } else { "" },
-                                            if no_verify { " --no-verify" } else { "" }
-                                        ),
-                                        &handle.clone(),
-                                        cx,
-                                    )
-                                } else {
-                                    Tooltip::simple(tooltip, cx)
-                                }
-                            }
-                        }),
-                    self.render_git_commit_menu(
+                        }
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w_px()
+                    .h(px(14.))
+                    .bg(foreground.opacity(0.35)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .h_full()
+                    .when(commit_enabled, |this| {
+                        this.hover(|style| style.bg(hover_background))
+                    })
+                    .child(self.render_git_commit_menu(
                         ElementId::Name(format!("split-button-right-{}", title).into()),
                         Some(commit_tooltip_focus_handle),
                         self.generate_commit_message_task.is_some(),
                         cx,
-                    )
-                    .into_any_element(),
-                )
-                .full_width(),
+                    )),
             )
     }
 
