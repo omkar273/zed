@@ -285,7 +285,7 @@ repl = { workspace = true, features = ["test-support"] }
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-caygnus@2x.png", "resources/app-icon-caygnus.png"]
-identifier = "dev.zed.Zed"
+identifier = "com.caygnus.zed"
 name = "Zed"
 category = "Developer Tool"
 osx_minimum_system_version = "10.15.7"
