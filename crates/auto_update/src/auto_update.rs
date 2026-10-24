@@ -48,6 +48,95 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
 
+/// Set by Caygnus's release workflow to the release tag being built, such as
+/// `caygnus-v1.27.0-4`. Release builds update from the fork's GitHub releases
+/// instead of Zed's servers; builds without a tag don't update themselves.
+const FORK_RELEASE_TAG: Option<&str> = option_env!("CAYGNUS_RELEASE_TAG");
+const FORK_RELEASE_REPO: &str = match option_env!("CAYGNUS_RELEASE_REPO") {
+    Some(repo) => repo,
+    None => "omkar273/zed",
+};
+
+fn updates_enabled(cx: &App) -> bool {
+    FORK_RELEASE_TAG.is_some()
+        || ReleaseChannel::try_global(cx)
+            .map(|channel| channel.poll_for_updates())
+            .unwrap_or(false)
+}
+
+/// Splits a release tag like `caygnus-v1.27.0-4` into the Zed version it was
+/// built from and the fork's build number for that version.
+fn parse_fork_release_tag(tag: &str) -> Option<(Version, u64)> {
+    let (version, build) = tag.strip_prefix("caygnus-v")?.rsplit_once('-')?;
+    Some((version.parse().ok()?, build.parse().ok()?))
+}
+
+/// The version shown while updating, e.g. `1.27.0+4`.
+fn fork_display_version(version: &Version, build: u64) -> Option<Version> {
+    let mut version = version.clone();
+    version.build = semver::BuildMetadata::new(&build.to_string()).ok()?;
+    Some(version)
+}
+
+fn newer_fork_release(
+    installed_tag: &str,
+    fetched_tag: &str,
+    status: &AutoUpdateStatus,
+) -> Option<Version> {
+    let (installed_version, installed_build) = parse_fork_release_tag(installed_tag)?;
+    let (fetched_version, fetched_build) = parse_fork_release_tag(fetched_tag)?;
+    let display_version = fork_display_version(&fetched_version, fetched_build)?;
+    if let AutoUpdateStatus::Updated { version } = status
+        && *version == display_version
+    {
+        return None;
+    }
+    ((fetched_version, fetched_build) > (installed_version, installed_build))
+        .then_some(display_version)
+}
+
+#[derive(Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+async fn fetch_latest_fork_release(client: &HttpClientWithUrl) -> Result<ReleaseAsset> {
+    anyhow::ensure!(OS == "macos", "Caygnus releases are only built for macOS");
+    let url = format!("https://api.github.com/repos/{FORK_RELEASE_REPO}/releases/latest");
+    let mut response = client.get(&url, Default::default(), true).await?;
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "failed to fetch the latest Caygnus release: {:?}",
+        String::from_utf8_lossy(&body),
+    );
+    let release: GitHubRelease =
+        serde_json::from_slice(&body).context("reading the latest Caygnus release")?;
+    let asset_suffix = format!("-{ARCH}.dmg");
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name.ends_with(&asset_suffix))
+        .with_context(|| {
+            format!(
+                "Caygnus release {} has no {ARCH} disk image",
+                release.tag_name
+            )
+        })?;
+    Ok(ReleaseAsset {
+        version: release.tag_name,
+        url: asset.browser_download_url,
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
     let os_release = match std::fs::read_to_string("/etc/os-release") {
@@ -278,13 +367,9 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
-        let poll_for_updates = ReleaseChannel::try_global(cx)
-            .map(|channel| channel.poll_for_updates())
-            .unwrap_or(false);
-
         if option_env!("ZED_UPDATE_EXPLANATION").is_none()
             && env::var("ZED_UPDATE_EXPLANATION").is_err()
-            && poll_for_updates
+            && updates_enabled(cx)
         {
             let mut update_subscription = AutoUpdateSetting::get_global(cx)
                 .0
@@ -322,10 +407,7 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
         return;
     }
 
-    if !ReleaseChannel::try_global(cx)
-        .map(|channel| channel.poll_for_updates())
-        .unwrap_or(false)
-    {
+    if !updates_enabled(cx) {
         return;
     }
 
@@ -358,7 +440,10 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
         ReleaseChannel::Nightly => {
             "https://github.com/zed-industries/zed/commits/nightly/".to_string()
         }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
+        ReleaseChannel::Dev => match FORK_RELEASE_TAG {
+            Some(tag) => format!("https://github.com/{FORK_RELEASE_REPO}/releases/tag/{tag}"),
+            None => "https://github.com/zed-industries/zed/commits/main/".to_string(),
+        },
     };
     Some(url)
 }
@@ -756,17 +841,29 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data =
-            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
-        let fetched_version = fetched_release_data.clone().version;
-        let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
-        let newer_version = Self::check_if_fetched_version_is_newer(
-            release_channel,
-            app_commit_sha,
-            installed_version,
-            fetched_version,
-            previous_status.clone(),
-        )?;
+        let (fetched_release_data, newer_version) = if let Some(installed_tag) = FORK_RELEASE_TAG {
+            let fetched_release_data = fetch_latest_fork_release(&client).await?;
+            let newer_version = newer_fork_release(
+                installed_tag,
+                &fetched_release_data.version,
+                &previous_status,
+            );
+            (fetched_release_data, newer_version)
+        } else {
+            let fetched_release_data =
+                Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
+            let fetched_version = fetched_release_data.clone().version;
+            let app_commit_sha =
+                Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
+            let newer_version = Self::check_if_fetched_version_is_newer(
+                release_channel,
+                app_commit_sha,
+                installed_version,
+                fetched_version,
+                previous_status.clone(),
+            )?;
+            (fetched_release_data, newer_version)
+        };
 
         let Some(newer_version) = newer_version else {
             this.update(cx, |this, cx| {
@@ -1208,11 +1305,16 @@ async fn install_release_macos(
     let mut mounted_app_path: OsString = mount_path.join(running_app_filename).into();
 
     mounted_app_path.push("/");
+    // Mount at a fixed path rather than under the disk image's volume name,
+    // which differs between builds (e.g. "Zed" or "Caygnus").
+    fs::create_dir_all(&mount_path)
+        .await
+        .context("failed to create the disk image mount point")?;
     let mut cmd = new_command("hdiutil");
     cmd.args(["attach", "-nobrowse"])
         .arg(&downloaded_dmg)
-        .arg("-mountroot")
-        .arg(temp_dir.path());
+        .arg("-mountpoint")
+        .arg(&mount_path);
     let output = cmd
         .output()
         .await
@@ -1616,6 +1718,45 @@ mod tests {
 
         let downloaded_len = std::fs::metadata(&target_path).unwrap().len();
         assert_eq!(downloaded_len, content_length as u64);
+    }
+
+    #[test]
+    fn test_parse_fork_release_tag() {
+        assert_eq!(
+            parse_fork_release_tag("caygnus-v1.27.0-4"),
+            Some((semver::Version::new(1, 27, 0), 4))
+        );
+        assert_eq!(parse_fork_release_tag("caygnus-20261024-dfe045e"), None);
+        assert_eq!(parse_fork_release_tag("v1.27.0"), None);
+    }
+
+    #[test]
+    fn test_newer_fork_release() {
+        let idle = AutoUpdateStatus::Idle;
+        assert_eq!(
+            newer_fork_release("caygnus-v1.27.0-4", "caygnus-v1.27.0-5", &idle),
+            "1.27.0+5".parse().ok()
+        );
+        assert_eq!(
+            newer_fork_release("caygnus-v1.27.0-4", "caygnus-v1.28.0-1", &idle),
+            "1.28.0+1".parse().ok()
+        );
+        assert_eq!(
+            newer_fork_release("caygnus-v1.27.0-4", "caygnus-v1.27.0-4", &idle),
+            None
+        );
+        assert_eq!(
+            newer_fork_release("caygnus-v1.28.0-1", "caygnus-v1.27.0-9", &idle),
+            None
+        );
+        // Already downloaded and waiting for a restart.
+        let updated = AutoUpdateStatus::Updated {
+            version: "1.27.0+5".parse().unwrap(),
+        };
+        assert_eq!(
+            newer_fork_release("caygnus-v1.27.0-4", "caygnus-v1.27.0-5", &updated),
+            None
+        );
     }
 
     #[test]
