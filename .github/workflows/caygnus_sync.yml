@@ -3,14 +3,21 @@
 # last release.
 #
 # If upstream merges cleanly, it is pushed straight to main. If it conflicts
-# with the fork's changes, the run pushes upstream to the upstream-sync branch,
-# opens a pull request for you to resolve and review, and fails so that you get
+# with the fork's changes, the run pushes it to the upstream-sync branch, opens
+# a pull request for you to resolve and review, and fails so that you get
 # notified. Later runs leave that pull request alone until you merge or close it.
 #
-# Needs a CAYGNUS_SYNC_TOKEN secret: a fine-grained token for this repository
-# with Contents, Workflows and Pull requests write access. GitHub refuses pushes
-# from the default token when the pushed commits change workflow files, and
-# upstream changes them often.
+# Without a CAYGNUS_SYNC_TOKEN secret it uses the built-in token, which can't
+# push changes to workflow files, so the merge keeps the fork's own
+# .github/workflows and drops upstream's changes there (the fork doesn't run
+# Zed's CI anyway). If GitHub still refuses the push, the run fails and asks you
+# to sync by hand. Opening the conflict pull request with the built-in token
+# needs "Allow GitHub Actions to create and approve pull requests" in the
+# repository's Actions settings.
+#
+# A CAYGNUS_SYNC_TOKEN secret (a fine-grained token for this repository with
+# Contents, Workflows and Pull requests write access) merges upstream's
+# workflows too and never needs a hand sync.
 name: caygnus_sync
 on:
   schedule:
@@ -19,6 +26,7 @@ on:
   workflow_dispatch: {}
 permissions:
   contents: write
+  pull-requests: write
 concurrency:
   group: caygnus-sync
   cancel-in-progress: false
@@ -31,31 +39,35 @@ jobs:
     outputs:
       release: ${{ steps.release.outputs.release }}
       sha: ${{ steps.release.outputs.sha }}
-      conflict_pr: ${{ steps.merge.outputs.conflict_pr }}
+      attention: ${{ steps.merge.outputs.attention }}
     steps:
-    - name: Check for the sync token
-      env:
-        CAYGNUS_SYNC_TOKEN: ${{ secrets.CAYGNUS_SYNC_TOKEN }}
-      run: |
-        if [[ -z "$CAYGNUS_SYNC_TOKEN" ]]; then
-          echo "::error::Add a CAYGNUS_SYNC_TOKEN secret with Contents, Workflows and Pull requests write access."
-          exit 1
-        fi
     - name: Check out
       uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       with:
         ref: main
         fetch-depth: 0
-        token: ${{ secrets.CAYGNUS_SYNC_TOKEN }}
+        token: ${{ secrets.CAYGNUS_SYNC_TOKEN || github.token }}
     - name: Merge upstream Zed
       id: merge
       env:
-        GH_TOKEN: ${{ secrets.CAYGNUS_SYNC_TOKEN }}
+        GH_TOKEN: ${{ secrets.CAYGNUS_SYNC_TOKEN || github.token }}
+        HAS_SYNC_TOKEN: ${{ secrets.CAYGNUS_SYNC_TOKEN != '' }}
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git remote add upstream https://github.com/zed-industries/zed.git
         git fetch --no-tags upstream main
+
+        # Replaces .github/workflows with the version in the given commit.
+        use_workflows_from() {
+          git rm -r -q -f --ignore-unmatch -- .github/workflows
+          git checkout "$1" -- .github/workflows
+        }
+
+        needs_attention() {
+          echo "$1" >> "$GITHUB_STEP_SUMMARY"
+          echo "attention=$1" >> "$GITHUB_OUTPUT"
+        }
 
         if git merge-base --is-ancestor upstream/main HEAD; then
           echo "main already has everything from upstream."
@@ -63,13 +75,25 @@ jobs:
         fi
 
         upstream_sha=$(git rev-parse --short upstream/main)
-        if git merge --no-ff --no-edit -m "Merge upstream Zed ${upstream_sha}" upstream/main; then
-          git push origin HEAD:main
-          echo "Merged upstream Zed ${upstream_sha} into main." >> "$GITHUB_STEP_SUMMARY"
-          exit 0
+        git merge --no-ff --no-commit upstream/main || true
+        git rev-parse -q --verify MERGE_HEAD > /dev/null \
+          || { echo "::error::git couldn't start merging upstream Zed ${upstream_sha}."; exit 1; }
+        if [[ "$HAS_SYNC_TOKEN" != "true" ]]; then
+          use_workflows_from HEAD
         fi
 
         conflicts=$(git diff --name-only --diff-filter=U)
+        if [[ -z "$conflicts" ]]; then
+          git commit -q --no-edit -m "Merge upstream Zed ${upstream_sha}"
+          if git push origin HEAD:main; then
+            echo "Merged upstream Zed ${upstream_sha} into main." >> "$GITHUB_STEP_SUMMARY"
+          else
+            git reset -q --hard origin/main
+            needs_attention "GitHub refused to push upstream Zed ${upstream_sha}, probably because it changes workflow files. Click Sync fork on https://github.com/${GITHUB_REPOSITORY}, or add a CAYGNUS_SYNC_TOKEN secret."
+          fi
+          exit 0
+        fi
+
         git merge --abort
 
         existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base main \
@@ -81,7 +105,18 @@ jobs:
           exit 0
         fi
 
-        git push --force origin "upstream/main:refs/heads/${SYNC_BRANCH}"
+        git checkout -q -B "$SYNC_BRANCH" upstream/main
+        if [[ "$HAS_SYNC_TOKEN" != "true" ]]; then
+          use_workflows_from origin/main
+          git commit -q --allow-empty -m "Keep Caygnus's workflows"
+        fi
+        if ! git push --force origin "HEAD:refs/heads/${SYNC_BRANCH}"; then
+          git checkout -q main
+          needs_attention "Upstream Zed ${upstream_sha} conflicts with the fork in: $(echo ${conflicts}). GitHub refused to push it for review, so merge it by hand, or add a CAYGNUS_SYNC_TOKEN secret."
+          exit 0
+        fi
+        git checkout -q main
+
         {
           echo "Upstream Zed \`${upstream_sha}\` conflicts with the fork, so it wasn't merged automatically."
           echo
@@ -102,10 +137,12 @@ jobs:
           echo
           echo "- N/A"
         } > pr-body.md
-        pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$SYNC_BRANCH" \
-          --title "Merge upstream Zed ${upstream_sha}" --body-file pr-body.md)
-        echo "Upstream conflicts with the fork; opened ${pr_url}." >> "$GITHUB_STEP_SUMMARY"
-        echo "conflict_pr=${pr_url}" >> "$GITHUB_OUTPUT"
+        if pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$SYNC_BRANCH" \
+          --title "Merge upstream Zed ${upstream_sha}" --body-file pr-body.md); then
+          needs_attention "Upstream Zed ${upstream_sha} conflicts with the fork. Resolve and merge ${pr_url}."
+        else
+          needs_attention "Upstream Zed ${upstream_sha} conflicts with the fork and is on the ${SYNC_BRANCH} branch, but the pull request couldn't be opened. Turn on \"Allow GitHub Actions to create and approve pull requests\" in the Actions settings, or open it from that branch by hand."
+        fi
     - name: Check whether main changed since the last release
       id: release
       env:
@@ -129,14 +166,14 @@ jobs:
       ref: ${{ needs.merge_upstream.outputs.sha }}
     permissions:
       contents: write
-  report_conflict:
+  report:
     needs: merge_upstream
-    if: needs.merge_upstream.outputs.conflict_pr != ''
+    if: needs.merge_upstream.outputs.attention != ''
     runs-on: ubuntu-latest
     steps:
-    - name: Ask for a manual merge
+    - name: Ask for a hand
       env:
-        CONFLICT_PR: ${{ needs.merge_upstream.outputs.conflict_pr }}
+        ATTENTION: ${{ needs.merge_upstream.outputs.attention }}
       run: |
-        echo "::error::Upstream Zed conflicts with the fork. Resolve and merge ${CONFLICT_PR}."
+        echo "::error::${ATTENTION}"
         exit 1
