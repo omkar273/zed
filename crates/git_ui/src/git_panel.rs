@@ -6974,7 +6974,6 @@ impl GitPanel {
         let (can_commit, _) = self.configure_commit_button(cx);
         let can_commit = can_commit && !self.modal_open;
         let commit_title = self.commit_button_title();
-        let is_reviewing_pull_request = self.reviewed_pull_request(cx).is_some();
 
         let (title, history_tooltip, history_action, next_tab) = if showing_history {
             (
@@ -7040,21 +7039,19 @@ impl GitPanel {
                                     }),
                             )
                         })
-                        .when(!is_reviewing_pull_request, |this| {
-                            this.child(
-                                panel_icon_button("toolbar-commit", IconName::Check)
-                                    .disabled(!can_commit)
-                                    .tooltip(Tooltip::for_action_title_in(
-                                        commit_title,
-                                        &git::Commit,
-                                        &self.focus_handle,
-                                    ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        let options = this.commit_options();
-                                        this.commit_changes(options, window, cx);
-                                    })),
-                            )
-                        })
+                        .child(
+                            panel_icon_button("toolbar-commit", IconName::Check)
+                                .disabled(!can_commit)
+                                .tooltip(Tooltip::for_action_title_in(
+                                    commit_title,
+                                    &git::Commit,
+                                    &self.focus_handle,
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let options = this.commit_options();
+                                    this.commit_changes(options, window, cx);
+                                })),
+                        )
                     })
                     .child(
                         panel_icon_button("toggle-history", IconName::Clock)
@@ -7068,56 +7065,6 @@ impl GitPanel {
                                 this.set_active_tab(next_tab, window, cx)
                             })),
                     )
-                    .map(|this| {
-                        if is_reviewing_pull_request {
-                            this.child(
-                                panel_icon_button("pull-request-overview", IconName::PullRequest)
-                                    .tooltip(Tooltip::for_action_title_in(
-                                        "Pull Request Overview",
-                                        &crate::pr_review::OpenOverview,
-                                        &self.focus_handle,
-                                    ))
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(
-                                            crate::pr_review::OpenOverview.boxed_clone(),
-                                            cx,
-                                        )
-                                    }),
-                            )
-                            .child(
-                                panel_icon_button("submit-pull-request-review", IconName::Chat)
-                                    .tooltip(Tooltip::for_action_title_in(
-                                        "Submit Review",
-                                        &crate::pr_review::SubmitReview,
-                                        &self.focus_handle,
-                                    ))
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(
-                                            crate::pr_review::SubmitReview.boxed_clone(),
-                                            cx,
-                                        )
-                                    }),
-                            )
-                        } else {
-                            this.child(
-                                panel_icon_button(
-                                    "start-pull-request-review",
-                                    IconName::PullRequest,
-                                )
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Review a Pull Request",
-                                    &crate::pr_review::StartReview,
-                                    &self.focus_handle,
-                                ))
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        crate::pr_review::StartReview.boxed_clone(),
-                                        cx,
-                                    )
-                                }),
-                            )
-                        }
-                    })
                     .when(show_changes_actions, |this| {
                         this.when(!embeds_panel_switcher, |this| {
                             this.child(self.render_view_options_menu("view_options_menu"))
@@ -7127,67 +7074,7 @@ impl GitPanel {
             )
     }
 
-    /// The PR number when this window is reviewing a pull request in a review copy.
-    fn reviewed_pull_request(&self, cx: &App) -> Option<u32> {
-        let workspace = self.workspace.upgrade()?;
-        crate::pr_review::current_review_copy(workspace.read(cx), cx).map(|copy| copy.pr_number)
-    }
-
-    /// Replaces the commit area in a review copy, where committing or pushing
-    /// would only create a stray review branch.
-    fn render_review_bar(&self, pr_number: u32, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .flex_none()
-            .w_full()
-            .px_2()
-            .py_1()
-            .gap_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                Icon::new(IconName::PullRequest)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(format!("Reviewing #{pr_number}"))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("review-add-comment", "Comment")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Small)
-                    .tooltip(Tooltip::for_action_title_in(
-                        "Comment on the Current Line",
-                        &crate::pr_review::AddComment,
-                        &self.focus_handle,
-                    ))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(crate::pr_review::AddComment.boxed_clone(), cx)
-                    }),
-            )
-            .child(
-                Button::new("review-submit", "Submit Review")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Small)
-                    .style(ButtonStyle::Tinted(TintColor::Accent))
-                    .tooltip(Tooltip::for_action_title_in(
-                        "Submit Review",
-                        &crate::pr_review::SubmitReview,
-                        &self.focus_handle,
-                    ))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(crate::pr_review::SubmitReview.boxed_clone(), cx)
-                    }),
-            )
-    }
-
     pub(crate) fn render_remote_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.reviewed_pull_request(cx).is_some() {
-            return None;
-        }
         let branch = self.active_repository.as_ref()?.read(cx).branch.clone();
         if !self.can_push_and_pull(cx) {
             return None;
@@ -9837,12 +9724,7 @@ impl Render for GitPanel {
                     })
                     .map(|this| match self.active_tab {
                         GitPanelTab::Changes => this
-                            .map(|this| match self.reviewed_pull_request(cx) {
-                                Some(pr_number) => {
-                                    this.child(self.render_review_bar(pr_number, cx))
-                                }
-                                None => this.children(self.render_footer(window, cx)),
-                            })
+                            .children(self.render_footer(window, cx))
                             .when(!self.commit_editor_expanded, |this| {
                                 this.map(|this| {
                                     if let Some(repo) = self.active_repository.clone()
