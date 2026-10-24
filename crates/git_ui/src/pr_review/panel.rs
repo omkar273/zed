@@ -22,7 +22,8 @@ use workspace::{
 
 use super::OpenTarget;
 use super::github::{
-    self, ChangeType, CheckStatus, PullRequestFile, PullRequestFiles, PullRequestSummary, Section,
+    self, ChangeType, CheckStatus, PullRequestFile, PullRequestFiles, PullRequestPage,
+    PullRequestSummary, Section,
 };
 
 actions!(
@@ -54,6 +55,42 @@ enum LoadState<T> {
     Failed(SharedString),
 }
 
+/// The pages of a section fetched so far.
+struct SectionPullRequests {
+    pull_requests: Vec<PullRequestSummary>,
+    total_count: usize,
+    next_cursor: Option<String>,
+    loading_more: bool,
+}
+
+impl SectionPullRequests {
+    fn new(page: PullRequestPage) -> Self {
+        Self {
+            pull_requests: page.pull_requests,
+            total_count: page.total_count,
+            next_cursor: page.next_cursor,
+            loading_more: false,
+        }
+    }
+
+    fn append(&mut self, page: PullRequestPage) {
+        // Search cursors are offsets, so a pull request opened since the last
+        // page shifts the results and repeats one we already have.
+        for pull_request in page.pull_requests {
+            if !self
+                .pull_requests
+                .iter()
+                .any(|existing| existing.number == pull_request.number)
+            {
+                self.pull_requests.push(pull_request);
+            }
+        }
+        self.total_count = page.total_count;
+        self.next_cursor = page.next_cursor;
+        self.loading_more = false;
+    }
+}
+
 #[derive(Clone)]
 enum Row {
     Section {
@@ -70,6 +107,10 @@ enum Row {
         section: Section,
         pull_request: PullRequestSummary,
         expanded: bool,
+    },
+    LoadMore {
+        section: Section,
+        loading: bool,
     },
     AllChanges {
         number: u32,
@@ -96,7 +137,7 @@ impl Row {
     fn depth(&self) -> usize {
         match self {
             Row::Section { .. } => 0,
-            Row::PullRequest { .. } => 1,
+            Row::PullRequest { .. } | Row::LoadMore { .. } => 1,
             Row::AllChanges { .. } => 2,
             Row::Message { depth, .. } | Row::Directory { depth, .. } | Row::File { depth, .. } => {
                 *depth
@@ -110,7 +151,10 @@ impl Row {
             Row::Section { expanded, .. }
             | Row::PullRequest { expanded, .. }
             | Row::Directory { expanded, .. } => Some(*expanded),
-            Row::Message { .. } | Row::AllChanges { .. } | Row::File { .. } => None,
+            Row::Message { .. }
+            | Row::LoadMore { .. }
+            | Row::AllChanges { .. }
+            | Row::File { .. } => None,
         }
     }
 
@@ -160,7 +204,7 @@ pub struct PullRequestsPanel {
     scroll_handle: UniformListScrollHandle,
     position: DockPosition,
     repo_dir: Option<PathBuf>,
-    sections: HashMap<Section, LoadState<Vec<PullRequestSummary>>>,
+    sections: HashMap<Section, LoadState<SectionPullRequests>>,
     expanded_sections: HashSet<Section>,
     /// Keyed by section too, so a pull request listed in two sections expands
     /// independently in each, like tree nodes in VS Code.
@@ -259,8 +303,8 @@ impl PullRequestsPanel {
             }
             match self.sections.get(&section) {
                 None => missing_sections.push(section),
-                Some(LoadState::Loaded(pull_requests)) => {
-                    for pull_request in pull_requests {
+                Some(LoadState::Loaded(loaded)) => {
+                    for pull_request in &loaded.pull_requests {
                         let number = pull_request.number;
                         if self.expanded_pull_requests.contains(&(section, number))
                             && !self.files.contains_key(&number)
@@ -290,7 +334,7 @@ impl PullRequestsPanel {
             let result = cx
                 .background_spawn({
                     let repo_dir = repo_dir.clone();
-                    async move { github::list_section(&repo_dir, section).await }
+                    async move { github::list_section(&repo_dir, section, None).await }
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -298,10 +342,63 @@ impl PullRequestsPanel {
                     return;
                 }
                 let state = match result {
-                    Ok(pull_requests) => LoadState::Loaded(pull_requests),
+                    Ok(page) => LoadState::Loaded(SectionPullRequests::new(page)),
                     Err(error) => LoadState::Failed(format!("{error:#}").into()),
                 };
                 this.sections.insert(section, state);
+                cx.notify();
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn load_more(&mut self, section: Section, cx: &mut Context<Self>) {
+        let Some(repo_dir) = self.repo_dir.clone() else {
+            return;
+        };
+        let Some(LoadState::Loaded(loaded)) = self.sections.get_mut(&section) else {
+            return;
+        };
+        if loaded.loading_more {
+            return;
+        }
+        let Some(cursor) = loaded.next_cursor.clone() else {
+            return;
+        };
+        loaded.loading_more = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let repo_dir = repo_dir.clone();
+                    let cursor = cursor.clone();
+                    async move { github::list_section(&repo_dir, section, Some(&cursor)).await }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.repo_dir.as_ref() != Some(&repo_dir) {
+                    return;
+                }
+                let Some(LoadState::Loaded(loaded)) = this.sections.get_mut(&section) else {
+                    return;
+                };
+                // A refresh replaced the section while this page was loading.
+                if !loaded.loading_more || loaded.next_cursor.as_ref() != Some(&cursor) {
+                    return;
+                }
+                let error = match result {
+                    Ok(page) => {
+                        loaded.append(page);
+                        None
+                    }
+                    Err(error) => {
+                        loaded.loading_more = false;
+                        Some(error)
+                    }
+                };
+                if let Some(error) = error {
+                    this.show_message(format!("Couldn't load more pull requests: {error:#}"), cx);
+                }
                 cx.notify();
             })
         })
@@ -401,9 +498,11 @@ impl PullRequestsPanel {
                 .background_spawn({
                     let changed = changed.clone();
                     async move {
-                        futures::future::join_all(changed.iter().map(|path| {
-                            github::set_file_viewed(&repo_dir, &node_id, path, viewed)
-                        }))
+                        futures::future::join_all(
+                            changed.iter().map(|path| {
+                                github::set_file_viewed(&repo_dir, &node_id, path, viewed)
+                            }),
+                        )
                         .await
                     }
                 })
@@ -436,7 +535,9 @@ impl PullRequestsPanel {
 
     fn show_message(&self, message: String, cx: &mut Context<Self>) {
         self.workspace
-            .update(cx, |workspace, cx| super::show_message(workspace, message, cx))
+            .update(cx, |workspace, cx| {
+                super::show_message(workspace, message, cx)
+            })
             .log_err();
     }
 
@@ -500,7 +601,13 @@ impl PullRequestsPanel {
             .log_err();
     }
 
-    fn open_file(&mut self, number: u32, path: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_file(
+        &mut self,
+        number: u32,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo_dir) = self.repo_dir.clone() else {
             return;
         };
@@ -520,6 +627,7 @@ impl PullRequestsPanel {
             Row::PullRequest { pull_request, .. } => {
                 self.review_pull_request(pull_request.number, &pull_request.title, window, cx)
             }
+            Row::LoadMore { section, .. } => self.load_more(section, cx),
             Row::AllChanges { number } => self.open_changes(number, window, cx),
             Row::Directory {
                 section,
@@ -549,7 +657,10 @@ impl PullRequestsPanel {
                 path,
                 ..
             } => self.toggle_directory(section, number, path, cx),
-            Row::Message { .. } | Row::AllChanges { .. } | Row::File { .. } => {}
+            Row::Message { .. }
+            | Row::LoadMore { .. }
+            | Row::AllChanges { .. }
+            | Row::File { .. } => {}
         }
     }
 
@@ -562,7 +673,8 @@ impl PullRequestsPanel {
     fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.rows.len() {
             self.selected = Some(index);
-            self.scroll_handle.scroll_to_item(index, ScrollStrategy::Top);
+            self.scroll_handle
+                .scroll_to_item(index, ScrollStrategy::Top);
             cx.notify();
         }
     }
@@ -602,12 +714,7 @@ impl PullRequestsPanel {
         }
     }
 
-    fn select_parent(
-        &mut self,
-        _: &menu::SelectParent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn select_parent(&mut self, _: &menu::SelectParent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(selected) = self.selected else {
             return;
         };
@@ -639,7 +746,7 @@ impl PullRequestsPanel {
             let expanded = self.expanded_sections.contains(&section);
             let state = self.sections.get(&section);
             let count = match state {
-                Some(LoadState::Loaded(pull_requests)) => Some(pull_requests.len()),
+                Some(LoadState::Loaded(loaded)) => Some(loaded.total_count),
                 _ => None,
             };
             rows.push(Row::Section {
@@ -657,15 +764,15 @@ impl PullRequestsPanel {
                     text: error.clone(),
                     is_error: true,
                 }),
-                Some(LoadState::Loaded(pull_requests)) if pull_requests.is_empty() => {
+                Some(LoadState::Loaded(loaded)) if loaded.pull_requests.is_empty() => {
                     rows.push(Row::Message {
                         depth: 1,
                         text: "No pull requests".into(),
                         is_error: false,
                     })
                 }
-                Some(LoadState::Loaded(pull_requests)) => {
-                    for pull_request in pull_requests {
+                Some(LoadState::Loaded(loaded)) => {
+                    for pull_request in &loaded.pull_requests {
                         let number = pull_request.number;
                         let expanded = self.expanded_pull_requests.contains(&(section, number));
                         rows.push(Row::PullRequest {
@@ -676,6 +783,12 @@ impl PullRequestsPanel {
                         if expanded {
                             self.push_file_rows(section, number, &mut rows);
                         }
+                    }
+                    if loaded.next_cursor.is_some() {
+                        rows.push(Row::LoadMore {
+                            section,
+                            loading: loaded.loading_more,
+                        });
                     }
                 }
             }
@@ -887,9 +1000,7 @@ impl PullRequestsPanel {
                         .color(Color::Muted)
                 }))
                 .into_any_element(),
-            Row::Message {
-                text, is_error, ..
-            } => {
+            Row::Message { text, is_error, .. } => {
                 let tooltip_text = text.clone();
                 container
                     .child(div().w(px(CHEVRON_WIDTH)).flex_none())
@@ -913,6 +1024,14 @@ impl PullRequestsPanel {
                 pull_request,
                 expanded,
             } => self.render_pull_request(container, index, *section, pull_request, *expanded, cx),
+            Row::LoadMore { loading, .. } => container
+                .child(div().w(px(CHEVRON_WIDTH)).flex_none())
+                .child(
+                    Label::new(if *loading { "Loading…" } else { "Load More" })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
             Row::AllChanges { .. } => container
                 .child(div().w(px(CHEVRON_WIDTH)).flex_none())
                 .child(
@@ -953,19 +1072,16 @@ impl PullRequestsPanel {
                     )
                     .child(folder_icon.size(IconSize::Small).color(Color::Muted))
                     .child(
-                        div().flex_1().min_w_0().overflow_hidden().child(
-                            Label::new(name.clone())
-                                .size(LabelSize::Small)
-                                .truncate(),
-                        ),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(Label::new(name.clone()).size(LabelSize::Small).truncate()),
                     )
                     .into_any_element()
             }
             Row::File {
-                number,
-                file,
-                name,
-                ..
+                number, file, name, ..
             } => self.render_file(container, index, *number, file, name, cx),
         }
     }
@@ -1095,7 +1211,10 @@ impl PullRequestsPanel {
                 div().flex_1().min_w_0().overflow_hidden().child(
                     Label::new(name.to_string())
                         .size(LabelSize::Small)
-                        .when(file.change_type == ChangeType::Deleted, Label::strikethrough)
+                        .when(
+                            file.change_type == ChangeType::Deleted,
+                            Label::strikethrough,
+                        )
                         .when(viewed, |label| label.color(Color::Muted))
                         .truncate(),
                 ),
@@ -1106,16 +1225,11 @@ impl PullRequestsPanel {
                 file.deletions as usize,
             ))
             .child(
-                div()
-                    .w(px(12.))
-                    .flex_none()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        Label::new(letter)
-                            .size(LabelSize::Small)
-                            .color(letter_color),
-                    ),
+                div().w(px(12.)).flex_none().flex().justify_center().child(
+                    Label::new(letter)
+                        .size(LabelSize::Small)
+                        .color(letter_color),
+                ),
             )
             .into_any_element()
     }
@@ -1312,6 +1426,42 @@ mod tests {
             change_type: ChangeType::Modified,
             viewed,
         }
+    }
+
+    fn summary(number: u32) -> PullRequestSummary {
+        PullRequestSummary {
+            number,
+            title: format!("Pull request {number}"),
+            author: "ada".into(),
+            is_draft: false,
+            head_ref_name: format!("branch-{number}"),
+            checks: CheckStatus::None,
+            review_decision: None,
+        }
+    }
+
+    fn page(numbers: &[u32], next_cursor: Option<&str>) -> PullRequestPage {
+        PullRequestPage {
+            pull_requests: numbers.iter().copied().map(summary).collect(),
+            total_count: 8,
+            next_cursor: next_cursor.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_section_appends_pages_without_duplicates() {
+        let mut section = SectionPullRequests::new(page(&[9, 8, 7, 6, 5], Some("cursor:5")));
+        section.loading_more = true;
+        // A new pull request was opened between pages, pushing 5 onto page two.
+        section.append(page(&[5, 4, 3], None));
+        let numbers: Vec<u32> = section
+            .pull_requests
+            .iter()
+            .map(|pull_request| pull_request.number)
+            .collect();
+        assert_eq!(numbers, vec![9, 8, 7, 6, 5, 4, 3]);
+        assert_eq!(section.next_cursor, None);
+        assert!(!section.loading_more);
     }
 
     #[test]

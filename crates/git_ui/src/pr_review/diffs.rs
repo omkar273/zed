@@ -133,7 +133,7 @@ async fn open_in_new_window(
 ) -> Result<()> {
     let open = cx.update(|_, cx| {
         workspace::open_paths(
-            &[opened.copy.dir.clone()],
+            std::slice::from_ref(&opened.copy.dir),
             app_state,
             OpenOptions {
                 open_mode: OpenMode::NewWindow,

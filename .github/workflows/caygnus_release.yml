@@ -1,0 +1,108 @@
+# Builds the Caygnus fork of Zed for Apple Silicon Macs and publishes the DMG
+# as a GitHub Release. Runs on GitHub's free macOS runners, so it is slower
+# than Zed's own release jobs; the cache makes later runs faster.
+#
+# Release by running this workflow on main, e.g.
+#   gh workflow run caygnus_release.yml --ref main -f tag=caygnus-v1.27.0-4
+# A run can only restore caches saved on its own ref or on the default branch
+# (main), so runs on main reuse each other's builds. A pushed tag still
+# releases and can restore main's cache, but the cache it saves belongs to
+# that tag and no later run can use it.
+name: caygnus_release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. caygnus-v1.27.0-4. Defaults to caygnus-<date>-<sha>.
+        required: false
+        type: string
+  push:
+    tags:
+    - caygnus-v*
+permissions:
+  contents: write
+concurrency:
+  group: caygnus-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  bundle_mac_aarch64:
+    if: github.repository_owner == 'omkar273'
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      # The free runner has 7 GB of memory and limited disk, so skip debug
+      # info. Crash reports aren't uploaded anywhere for this build.
+      CARGO_PROFILE_RELEASE_DEBUG: 'false'
+      ZED_SKIP_DMG_LICENSE: '1'
+    steps:
+    - name: Check out
+      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+    - name: Set up Node
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      with:
+        node-version: '24'
+        package-manager-cache: false
+    - name: Restore the Rust build cache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ~/.cargo/bin
+          target
+        key: caygnus-mac-aarch64-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          caygnus-mac-aarch64-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+          caygnus-mac-aarch64-
+    - name: Show the runner and toolchain
+      run: |
+        sw_vers
+        sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+        df -h /
+        xcodebuild -version
+        xcrun --sdk macosx --show-sdk-version
+        rustup show active-toolchain || rustup toolchain install
+    - name: Build and bundle
+      run: ./script/bundle-mac aarch64-apple-darwin
+    - name: Show disk use
+      if: always()
+      run: |
+        df -h /
+        du -sh target || true
+    - name: Publish the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        INPUT_TAG: ${{ inputs.tag }}
+      run: |
+        if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+          tag="$GITHUB_REF_NAME"
+        elif [[ -n "$INPUT_TAG" ]]; then
+          tag="$INPUT_TAG"
+        else
+          tag="caygnus-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+        fi
+        version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+          target/aarch64-apple-darwin/release/dmg/Caygnus.app/Contents/Info.plist)
+        cp target/aarch64-apple-darwin/release/Caygnus-aarch64.dmg "Caygnus-${tag}-aarch64.dmg"
+        cat > release-notes.md <<EOF
+        Caygnus ${version}, a fork of Zed, built from ${GITHUB_SHA::7}.
+
+        **Apple Silicon Macs only** (M1 or later).
+
+        ### Install
+
+        1. Open the DMG and drag **Caygnus** into Applications.
+        2. The app isn't signed with an Apple Developer ID, so macOS blocks it the first time. Run this once in Terminal:
+
+           \`\`\`
+           xattr -dr com.apple.quarantine /Applications/Caygnus.app
+           \`\`\`
+
+        The app's bundle id is \`com.caygnus.Caygnus\`, so it installs next to official Zed instead of replacing it. It doesn't update itself; download a newer release to update.
+        EOF
+        gh release create "$tag" "Caygnus-${tag}-aarch64.dmg" \
+          --target "$GITHUB_SHA" \
+          --title "Caygnus ${tag}" \
+          --notes-file release-notes.md

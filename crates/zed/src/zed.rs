@@ -1723,7 +1723,7 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some("About Caygnus".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),
@@ -8286,6 +8286,67 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_startup_with_nothing_to_restore_opens_no_untitled_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(|cx| db::kvp::KeyValueStore::global(cx))
+            .write_kvp(onboarding::FIRST_OPEN.to_string(), "false".to_string())
+            .await
+            .unwrap();
+
+        fn item_counts_per_window(cx: &mut TestAppContext) -> Vec<usize> {
+            cx.read(|cx| {
+                cx.windows()
+                    .into_iter()
+                    .filter_map(|window| window.downcast::<MultiWorkspace>())
+                    .map(|window| {
+                        window
+                            .read(cx)
+                            .unwrap()
+                            .workspace()
+                            .read(cx)
+                            .items(cx)
+                            .count()
+                    })
+                    .collect()
+            })
+        }
+
+        // `restore_on_startup` defaults to `last_session`, and there is no
+        // previous session, so startup should land on the welcome page.
+        let mut async_cx = cx.to_async();
+        crate::restore_or_create_workspace(app_state.clone(), &mut async_cx)
+            .await
+            .expect("failed to open a workspace");
+        cx.run_until_parked();
+        assert_eq!(item_counts_per_window(cx), vec![0]);
+
+        for window in cx.read(|cx| cx.windows()) {
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+        }
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.restore_on_startup =
+                        Some(workspace::RestoreOnStartupBehavior::EmptyTab);
+                });
+            });
+        });
+
+        let mut async_cx = cx.to_async();
+        crate::restore_or_create_workspace(app_state.clone(), &mut async_cx)
+            .await
+            .expect("failed to open a workspace");
+        cx.run_until_parked();
+        assert_eq!(item_counts_per_window(cx), vec![1]);
     }
 
     #[gpui::test]
