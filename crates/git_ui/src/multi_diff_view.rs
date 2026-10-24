@@ -30,6 +30,7 @@ use workspace::{
 pub struct MultiDiffView {
     editor: Entity<SplittableEditor>,
     file_count: usize,
+    title_override: Option<SharedString>,
     _editor_event_subscription: Subscription,
     _buffer_language_subscription: Subscription,
 }
@@ -39,6 +40,19 @@ struct Entry {
     new_path: PathBuf,
     new_buffer: Entity<Buffer>,
     diff: Entity<BufferDiff>,
+    display_path: Option<String>,
+}
+
+/// How `MultiDiffView::open_with_options` presents the diff.
+#[derive(Default)]
+pub struct MultiDiffOptions {
+    /// The tab title, instead of the default "N files" summary.
+    pub title: Option<SharedString>,
+    /// Leaves the left dock open, for diffs opened from a panel there.
+    pub keep_left_dock_open: bool,
+    /// The path shown in each file's header, in the order of the diff pairs,
+    /// instead of the new file's path relative to the common root.
+    pub display_paths: Option<Vec<String>>,
 }
 
 async fn load_entries(
@@ -68,6 +82,7 @@ async fn load_entries(
             new_path,
             new_buffer: new_buffer.clone(),
             diff,
+            display_path: None,
         });
     }
 
@@ -90,17 +105,24 @@ fn register_entry(
         .map(|hunk| hunk.buffer_range.to_point(&snapshot))
         .collect();
 
-    let display_rel = common_root
-        .as_ref()
-        .and_then(|root| entry.new_path.strip_prefix(root).ok())
-        .map(|rel| {
-            RelPath::new(rel, PathStyle::local())
-                .map(|r| r.into_owned().into())
-                .unwrap_or_else(|_| {
-                    RelPath::new(Path::new(MultiBuffer::DEFAULT_TITLE), PathStyle::Unix)
-                        .unwrap()
-                        .into_owned()
-                        .into()
+    let display_rel = entry
+        .display_path
+        .as_deref()
+        .and_then(|path| RelPath::new(Path::new(path), PathStyle::Unix).ok())
+        .map(|rel| rel.into_owned().into())
+        .or_else(|| {
+            common_root
+                .as_ref()
+                .and_then(|root| entry.new_path.strip_prefix(root).ok())
+                .map(|rel| {
+                    RelPath::new(rel, PathStyle::local())
+                        .map(|r| r.into_owned().into())
+                        .unwrap_or_else(|_| {
+                            RelPath::new(Path::new(MultiBuffer::DEFAULT_TITLE), PathStyle::Unix)
+                                .unwrap()
+                                .into_owned()
+                                .into()
+                        })
                 })
         })
         .unwrap_or_else(|| {
@@ -154,12 +176,39 @@ impl MultiDiffView {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
+        Self::open_with_options(
+            diff_pairs,
+            MultiDiffOptions::default(),
+            workspace,
+            window,
+            cx,
+        )
+    }
+
+    /// Like `open`, with the tab title, file labels and dock behavior in `options`.
+    pub fn open_with_options(
+        diff_pairs: Vec<[String; 2]>,
+        options: MultiDiffOptions,
+        workspace: &Workspace,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
         let project = workspace.project().clone();
         let workspace = workspace.weak_handle();
         let context_lines = multibuffer_context_lines(cx);
 
         window.spawn(cx, async move |cx| {
-            let (entries, common_root) = load_entries(diff_pairs, &project, cx).await?;
+            let MultiDiffOptions {
+                title,
+                keep_left_dock_open,
+                display_paths,
+            } = options;
+            let (mut entries, common_root) = load_entries(diff_pairs, &project, cx).await?;
+            if let Some(display_paths) = display_paths {
+                for (entry, display_path) in entries.iter_mut().zip(display_paths) {
+                    entry.display_path = Some(display_path);
+                }
+            }
 
             workspace.update_in(cx, |workspace, window, cx| {
                 let multibuffer = cx.new(|cx| {
@@ -175,14 +224,16 @@ impl MultiDiffView {
 
                 let workspace_handle = cx.entity();
                 let diff_view = cx.new(|cx| {
-                    Self::new(
+                    let mut view = Self::new(
                         multibuffer.clone(),
                         project.clone(),
                         file_count,
                         window,
                         workspace_handle,
                         cx,
-                    )
+                    );
+                    view.title_override = title;
+                    view
                 });
 
                 let pane = workspace.active_pane();
@@ -190,10 +241,12 @@ impl MultiDiffView {
                     pane.add_item(Box::new(diff_view.clone()), true, true, None, window, cx);
                 });
 
-                // Hide the left dock (file explorer) for a cleaner diff view
-                workspace.left_dock().update(cx, |dock, cx| {
-                    dock.set_open(false, window, cx);
-                });
+                if !keep_left_dock_open {
+                    // Hide the left dock (file explorer) for a cleaner diff view
+                    workspace.left_dock().update(cx, |dock, cx| {
+                        dock.set_open(false, window, cx);
+                    });
+                }
 
                 diff_view
             })
@@ -253,12 +306,20 @@ impl MultiDiffView {
         Self {
             editor,
             file_count,
+            title_override: None,
             _editor_event_subscription: editor_event_subscription,
             _buffer_language_subscription: buffer_language_subscription,
         }
     }
 
+    pub(crate) fn title_override(&self) -> Option<&SharedString> {
+        self.title_override.as_ref()
+    }
+
     fn title(&self) -> SharedString {
+        if let Some(title) = &self.title_override {
+            return title.clone();
+        }
         let suffix = if self.file_count == 1 {
             "1 file".to_string()
         } else {

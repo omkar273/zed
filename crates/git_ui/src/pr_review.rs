@@ -11,25 +11,37 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow};
 use editor::Editor;
-use gpui::{App, SharedString, WeakEntity, actions};
+use gpui::{App, EntityId, Global, SharedString, WeakEntity, actions};
 use language::Point;
 use serde::{Deserialize, Serialize};
 use ui::prelude::*;
 use util::ResultExt as _;
 use workspace::{
-    OpenMode, OpenOptions, Toast, Workspace,
+    OpenOptions, Toast, Workspace,
     notifications::{NotificationId, NotifyTaskExt as _},
 };
 
 use crate::picker_prompt;
 
+mod diffs;
+mod github;
 mod inline_comments;
 mod overview;
+pub mod panel;
+
+/// Where a pull request opens when picked in the Pull Requests panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenTarget {
+    /// Diff tabs in the current window, from a review copy kept in the background.
+    ThisWindow,
+    /// The review copy opened as its own window.
+    NewWindow,
+}
 
 actions!(
     pr_review,
     [
-        /// Picks an open pull request and opens it for review in a new window.
+        /// Picks an open pull request and opens its overview and changes in this window.
         StartReview,
         /// Opens the overview of the pull request this window is reviewing.
         OpenOverview,
@@ -83,6 +95,18 @@ impl ReviewCopy {
             .or_else(|| Self::for_worktree_root_in(root, &default_reviews_dir()))
     }
 
+    /// The review copy a file or directory is in, if any.
+    pub fn for_path(abs_path: &Path) -> Option<Self> {
+        Self::for_path_in(abs_path, &reviews_dir())
+            .or_else(|| Self::for_path_in(abs_path, &default_reviews_dir()))
+    }
+
+    fn for_path_in(abs_path: &Path, reviews_dir: &Path) -> Option<Self> {
+        abs_path
+            .ancestors()
+            .find_map(|ancestor| Self::for_worktree_root_in(ancestor, reviews_dir))
+    }
+
     fn for_worktree_root_in(root: &Path, reviews_dir: &Path) -> Option<Self> {
         if root.parent()? != reviews_dir {
             return None;
@@ -116,6 +140,18 @@ impl ReviewCopy {
 
     pub fn submitted_notes_path(&self) -> PathBuf {
         notes_dir().join(format!("{}.submitted.md", self.name))
+    }
+
+    /// Where the merge base versions of the PR's files are written for diffing.
+    pub fn base_files_dir(&self) -> PathBuf {
+        reviews_dir().join(".base").join(&self.name)
+    }
+
+    /// Where empty stand-ins for the files the PR deletes are written.
+    pub fn deleted_files_dir(&self) -> PathBuf {
+        reviews_dir()
+            .join(".base")
+            .join(format!("{}.deleted", self.name))
     }
 }
 
@@ -809,7 +845,7 @@ pub(crate) fn register(workspace: &mut Workspace) {
         let Some(copy) = require_review_copy(workspace, cx) else {
             return;
         };
-        let Some((path, line)) = active_file_and_line(workspace, cx) else {
+        let Some((path, line)) = active_file_and_line(workspace, &copy, cx) else {
             show_message(
                 workspace,
                 "Put the cursor on a line in one of this pull request's files first.",
@@ -847,15 +883,47 @@ pub(crate) fn current_review_copy(workspace: &Workspace, cx: &App) -> Option<Rev
         .find_map(|worktree| ReviewCopy::for_worktree_root(&worktree.read(cx).abs_path()))
 }
 
+/// The pull requests opened in each window's own tabs, most recent last.
+#[derive(Default)]
+struct OpenedPullRequests(HashMap<EntityId, ReviewCopy>);
+
+impl Global for OpenedPullRequests {}
+
+/// Remembers that `copy` was opened in this window's tabs, so review actions
+/// apply to it when the active tab doesn't show one of its files.
+pub(crate) fn remember_opened_copy(workspace: &Workspace, copy: ReviewCopy, cx: &mut App) {
+    let workspace_id = workspace.weak_handle().entity_id();
+    cx.default_global::<OpenedPullRequests>()
+        .0
+        .insert(workspace_id, copy);
+}
+
+/// The pull request that review actions apply to in this window: the one the
+/// active editor shows, else the review copy opened as this window, else the
+/// one last opened in this window's tabs.
+pub(crate) fn resolve_review_copy(workspace: &Workspace, cx: &App) -> Option<ReviewCopy> {
+    workspace
+        .active_item_as::<Editor>(cx)
+        .and_then(|editor| inline_comments::editor_review_copy(editor.read(cx)))
+        .or_else(|| current_review_copy(workspace, cx))
+        .or_else(|| {
+            let workspace_id = workspace.weak_handle().entity_id();
+            cx.try_global::<OpenedPullRequests>()?
+                .0
+                .get(&workspace_id)
+                .cloned()
+        })
+}
+
 fn require_review_copy(
     workspace: &mut Workspace,
     cx: &mut Context<Workspace>,
 ) -> Option<ReviewCopy> {
-    let copy = current_review_copy(workspace, cx);
+    let copy = resolve_review_copy(workspace, cx);
     if copy.is_none() {
         show_message(
             workspace,
-            "This window is not reviewing a pull request. Run \"pr review: start review\" first.",
+            "No pull request is open here. Open one from the Pull Requests panel first.",
             cx,
         );
     }
@@ -874,15 +942,20 @@ pub(crate) fn show_message(
 }
 
 /// The repository-relative path and 1-based line under the cursor of the active editor,
-/// including in diff views.
-fn active_file_and_line(workspace: &Workspace, cx: &mut App) -> Option<(String, u32)> {
+/// including in diff views, when that file belongs to `copy`.
+fn active_file_and_line(
+    workspace: &Workspace,
+    copy: &ReviewCopy,
+    cx: &mut App,
+) -> Option<(String, u32)> {
     let editor = workspace.active_item_as::<Editor>(cx)?;
     editor.update(cx, |editor, cx| {
         let snapshot = editor.display_snapshot(cx);
         let head = editor.selections.newest::<Point>(&snapshot).head();
         let (buffer, point) = editor.buffer().read(cx).point_to_buffer_point(head, cx)?;
-        let file = buffer.read(cx).file()?.clone();
-        Some((file.path().as_unix_str().to_string(), point.row + 1))
+        let abs_path = buffer.read(cx).file()?.as_local()?.abs_path(cx);
+        let path = inline_comments::relative_unix_path(&abs_path, &copy.dir)?;
+        Some((path, point.row + 1))
     })
 }
 
@@ -948,7 +1021,6 @@ fn start_review(
         );
         return;
     };
-    let app_state = workspace.app_state().clone();
     let workspace_handle = cx.weak_entity();
     show_message(workspace, "Loading pull requests…", cx);
     cx.spawn_in(window, {
@@ -973,7 +1045,11 @@ fn start_review(
                         "#{} {}{}  @{}",
                         pull_request.number,
                         pull_request.title,
-                        if pull_request.is_draft { " (draft)" } else { "" },
+                        if pull_request.is_draft {
+                            " (draft)"
+                        } else {
+                            ""
+                        },
                         pull_request.author.login
                     ))
                 })
@@ -993,42 +1069,15 @@ fn start_review(
                 return Ok(());
             };
             let pr_number = pull_request.number;
-            workspace_handle.update(cx, |workspace, cx| {
-                show_message(
+            workspace_handle.update_in(cx, |workspace, window, cx| {
+                diffs::open_pull_request(
                     workspace,
-                    format!("Preparing a review copy of #{pr_number}…"),
+                    repo_dir,
+                    pr_number,
+                    OpenTarget::ThisWindow,
+                    window,
                     cx,
                 )
-            })?;
-            let opened = cx
-                .background_spawn(async move { prepare_review_copy(&repo_dir, pr_number).await })
-                .await?;
-            let open = cx.update(|_, cx| {
-                workspace::open_paths(
-                    &[opened.copy.dir.clone()],
-                    app_state,
-                    OpenOptions {
-                        open_mode: OpenMode::NewWindow,
-                        ..Default::default()
-                    },
-                    cx,
-                )
-            })?;
-            let result = open.await?;
-            let copy = opened.copy;
-            let kept_local_edits = opened.kept_local_edits;
-            result.window.update(cx, |_, window, cx| {
-                result.workspace.update(cx, |workspace, cx| {
-                    workspace.open_panel::<crate::git_panel::GitPanel>(window, cx);
-                    overview::open_overview(workspace, copy, window, cx);
-                    if kept_local_edits {
-                        show_message(
-                            workspace,
-                            "The pull request has new commits, but this review copy has your edits, so it was not refreshed.",
-                            cx,
-                        );
-                    }
-                })
             })?;
             Ok(())
         }
@@ -1058,6 +1107,31 @@ mod tests {
             ReviewCopy::for_worktree_root_in(&reviews.join("kip-branch-main"), reviews).is_none()
         );
         assert!(ReviewCopy::for_worktree_root_in(Path::new("/src/kip-pr-42"), reviews).is_none());
+    }
+
+    #[test]
+    fn test_review_copy_for_path() {
+        let reviews = Path::new("/home/me/.cache/pr-reviews");
+        let copy =
+            ReviewCopy::for_path_in(&reviews.join("kip-pr-42/src/main.rs"), reviews).unwrap();
+        assert_eq!(copy.dir, reviews.join("kip-pr-42"));
+        assert_eq!(copy.pr_number, 42);
+        assert_eq!(
+            ReviewCopy::for_path_in(&reviews.join("kip-pr-42"), reviews).map(|copy| copy.dir),
+            Some(reviews.join("kip-pr-42"))
+        );
+        // A folder inside the copy that looks like a copy doesn't count.
+        assert_eq!(
+            ReviewCopy::for_path_in(&reviews.join("kip-pr-42/vendor/x-pr-9/lib.rs"), reviews)
+                .map(|copy| copy.pr_number),
+            Some(42)
+        );
+        // The merge base files are not part of the copy.
+        assert!(
+            ReviewCopy::for_path_in(&reviews.join(".base/kip-pr-42/src/main.rs"), reviews)
+                .is_none()
+        );
+        assert!(ReviewCopy::for_path_in(Path::new("/src/kip/src/main.rs"), reviews).is_none());
     }
 
     #[test]

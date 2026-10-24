@@ -104,7 +104,7 @@ pub(crate) fn init(cx: &mut App) {
 
 /// Reloads the posted and pending comments of the review copy this window shows.
 pub(crate) fn refresh(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
-    if let Some(copy) = super::current_review_copy(workspace, cx) {
+    if let Some(copy) = super::resolve_review_copy(workspace, cx) {
         load_comments(copy, cx);
     }
 }
@@ -198,12 +198,32 @@ async fn read_pending(copy: &ReviewCopy) -> Vec<(String, InlineComment)> {
         .collect()
 }
 
+/// The review copy whose files the editor shows: the first of its buffers that
+/// lives in one, or else a review copy opened as the project's worktree, whose
+/// diff views fill in their buffers later.
 fn review_copy_for_editor(editor: &Editor, cx: &App) -> Option<ReviewCopy> {
-    let project = editor.project()?;
-    project
+    editor
+        .buffer()
         .read(cx)
-        .visible_worktrees(cx)
-        .find_map(|worktree| ReviewCopy::for_worktree_root(&worktree.read(cx).abs_path()))
+        .all_buffers()
+        .into_iter()
+        .find_map(|buffer| {
+            let file = buffer.read(cx).file()?.as_local()?;
+            ReviewCopy::for_path(&file.abs_path(cx))
+        })
+        .or_else(|| {
+            editor
+                .project()?
+                .read(cx)
+                .visible_worktrees(cx)
+                .find_map(|worktree| ReviewCopy::for_worktree_root(&worktree.read(cx).abs_path()))
+        })
+}
+
+/// The review copy the editor shows comments for, if any.
+pub(super) fn editor_review_copy(editor: &Editor) -> Option<ReviewCopy> {
+    let addon = editor.addon::<InlineCommentsAddon>()?;
+    ReviewCopy::for_worktree_root(&addon.copy_dir)
 }
 
 fn register_editor(editor: &mut Editor, cx: &mut Context<Editor>) {
@@ -613,7 +633,8 @@ fn render_composer_block(composer: &Entity<CommentComposer>, cx: &mut BlockConte
         .into_any_element()
 }
 
-fn relative_unix_path(abs_path: &Path, copy_dir: &Path) -> Option<String> {
+/// `abs_path` relative to `copy_dir`, with `/` separators.
+pub(super) fn relative_unix_path(abs_path: &Path, copy_dir: &Path) -> Option<String> {
     let relative = abs_path.strip_prefix(copy_dir).ok()?;
     let parts = relative
         .components()
