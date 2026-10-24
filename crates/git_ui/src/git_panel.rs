@@ -1365,8 +1365,8 @@ impl From<&Arc<InitialGraphCommitData>> for CommitHistoryEntry {
 const DEFAULT_COMMIT_PLACEHOLDER: &str = "Message (⌘⏎ to commit)";
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_COMMIT_PLACEHOLDER: &str = "Message (Ctrl+Enter to commit)";
-const MIN_PANEL_EDITOR_LINES: usize = 1;
-const MAX_PANEL_EDITOR_LINES: usize = 6;
+const MIN_PANEL_EDITOR_LINES: usize = 3;
+const MAX_PANEL_EDITOR_LINES: usize = 10;
 
 pub(crate) fn commit_message_editor(
     commit_message_buffer: Entity<Buffer>,
